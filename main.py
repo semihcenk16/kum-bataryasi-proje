@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 ===============================================================================
- TERMAL KUM BATARYASI (SAND BATTERY) - PARAMETRİK TASARIM VE SİMÜLASYON ARACI  (v3)
+ TERMAL KUM BATARYASI (SAND BATTERY) - PARAMETRİK TASARIM VE SİMÜLASYON ARACI  (v4)
 ===============================================================================
  Çalıştırmak için:
      pip install streamlit pandas numpy plotly
@@ -27,6 +27,9 @@
 
  (3) v3 EKLERİ: parametre taraması (Analiz), optimizasyon (hedef enerji için optimum H/R
      ve yalıtım kalınlığı), JSON dışa/içe aktarma + silme, Markdown/TXT rapor çıktısı.
+
+ (4) v4 EKLERİ: hibrit (kompozit) yatak malzemesi, CSP şarj kaynağı (Q_solar = A·DNI·η) ve
+     N modüllü tesis (3D görselleştirme + yüzey alanına bağlı ısı kaybı trade-off analizi).
 ===============================================================================
 """
 
@@ -58,6 +61,10 @@ PROFILE_COLORS = ["#ef4444", "#f97316", "#eab308", "#22c55e", "#3b82f6", "#64748
 
 CP_CONST = "Sabit (ortalama c_p)"
 CP_VAR = "Sıcaklığa bağımlı c_p(T)"
+MIX_VOL = "Hacimce"
+MIX_MASS = "Kütlece"
+SRC_ELEC = "Elektrikli Rezistans"
+SRC_CSP = "CSP (Fresnel Lens / Helyostat)"
 
 # ρ: YIĞIN (bulk) yoğunluk. Boşluklu yatak için m = ρ_yığın·V kullanılır.
 # c_p(T) = cp25 + β·(T − 25):  kuvars için 25 °C'de ~740, 500 °C'de ~1170 J/kg·K civarıdır
@@ -66,9 +73,16 @@ CP_VAR = "Sıcaklığa bağımlı c_p(T)"
 MATERIALS = {
     "Silika Kumu (Kuvars)": {"rho": 1600.0, "cp": 1000.0, "cp25": 740.0, "beta": 0.90},
     "Bazalt (kırma)": {"rho": 1750.0, "cp": 950.0, "cp25": 850.0, "beta": 0.42},
+    # Refrakter (şamot) kırığı: yığın ≈ 1900 kg/m³, c_p(T) ≈ 840 + 0.35·(T−25) J/kg·K
+    "Refrakter (şamot, kırma)": {"rho": 1900.0, "cp": 930.0, "cp25": 840.0, "beta": 0.35},
     "Manuel Giriş": {"rho": 1600.0, "cp": 1000.0, "cp25": 740.0, "beta": 0.90},
 }
-PRESET_NAMES = ["Silika Kumu (Kuvars)", "Bazalt (kırma)"]
+PRESET_NAMES = ["Silika Kumu (Kuvars)", "Bazalt (kırma)", "Refrakter (şamot, kırma)"]
+CATEGORICAL = {
+    "material": list(MATERIALS.keys()), "cp_mode": [CP_CONST, CP_VAR],
+    "mat1": PRESET_NAMES, "mat2": PRESET_NAMES,
+    "mix_basis": [MIX_VOL, MIX_MASS], "charge_src": [SRC_ELEC, SRC_CSP],
+}
 
 # Bir "konfigürasyon" = aşağıdaki anahtarların hepsi. Anahtar adları aynı zamanda
 # yan menü widget'larının session_state anahtarlarıdır (yükleme/kaydetme bu sayede kolaydır).
@@ -81,6 +95,11 @@ DEFAULT_CFG = {
     "p_heat_mw": 5.0, "p_dis_mw": 2.0,
     "eta_heater_pct": 99.0, "h_out": 10.0, "hold_days": 2.0,
     "n_cells": 100, "k_eff": 0.8, "cut_ch_pct": 10, "cut_dis_pct": 70,
+    # --- v4: hibrit karışım, şarj kaynağı, modüler tesis ---
+    "hybrid": False, "mat1": "Refrakter (şamot, kırma)", "mat2": "Bazalt (kırma)",
+    "mix_pct": 30, "mix_basis": MIX_VOL,
+    "charge_src": SRC_ELEC, "csp_area": 10000.0, "csp_dni": 850.0, "csp_eta_pct": 70.0,
+    "n_modules": 1,
 }
 CFG_KEYS = list(DEFAULT_CFG.keys())
 CUR = "▶ Mevcut girdiler"
@@ -97,6 +116,8 @@ CFG_LIMITS = {
     "p_heat_mw": (0.1, 100.0), "p_dis_mw": (0.1, 100.0),
     "eta_heater_pct": (90.0, 100.0), "h_out": (3.0, 50.0), "hold_days": (0.0, 365.0),
     "n_cells": (20, 150), "k_eff": (0.1, 5.0), "cut_ch_pct": (1, 30), "cut_dis_pct": (30, 95),
+    "mix_pct": (0, 100), "csp_area": (100.0, 1000000.0), "csp_dni": (100.0, 1400.0),
+    "csp_eta_pct": (10.0, 95.0), "n_modules": (1, 20),
 }
 
 
@@ -182,6 +203,68 @@ def ua_vec(r, h, t, k, h_out):
     return 1.0 / R_side + 2.0 / R_end
 
 
+def composite_props(m1, m2, pct1, basis):
+    """
+    Hibrit (kompozit) yatak özellikleri — ağırlıklı ortalama.
+
+    Oran HACİMCE verilirse (φ1 = pct1/100):
+        ρ_karışım = φ1 ρ1 + φ2 ρ2                       (hacim ağırlıklı)
+        w1 = φ1 ρ1 / ρ_karışım                          (kütle kesri)
+    Oran KÜTLECE verilirse (w1 = pct1/100):
+        1/ρ_karışım = w1/ρ1 + w2/ρ2                     (harmonik; hacimler toplanır)
+        φ1 = w1 ρ_karışım / ρ1
+    Özgül ısı HER ZAMAN kütle ağırlıklı ortalamadır:
+        c_p = w1 c_p1 + w2 c_p2   (c_p(T) lineer olduğundan c_p,25 ve β da aynı şekilde karıştırılır)
+    Neden? Isıl enerji kütleyle orantılıdır: ρ_k c_p,k = φ1 ρ1 c_p1 + φ2 ρ2 c_p2 özdeşliği tam sağlanır,
+    yani karışımın hacimsel ısı kapasitesi iki bileşenin toplamıdır (ideal karışım: hacimler toplanır,
+    boşluk doldurma etkisi ihmal edilir).
+    """
+    a, b = MATERIALS[m1], MATERIALS[m2]
+    f1 = pct1 / 100.0
+    if basis == MIX_VOL:
+        phi1 = f1
+        rho = phi1 * a["rho"] + (1.0 - phi1) * b["rho"]
+        w1 = phi1 * a["rho"] / rho
+    else:
+        w1 = f1
+        rho = 1.0 / (w1 / a["rho"] + (1.0 - w1) / b["rho"])
+        phi1 = w1 * rho / a["rho"]
+    w2 = 1.0 - w1
+    return {"rho": rho, "cp": w1 * a["cp"] + w2 * b["cp"], "cp25": w1 * a["cp25"] + w2 * b["cp25"],
+            "beta": w1 * a["beta"] + w2 * b["beta"], "phi1": phi1, "w1": w1}
+
+
+def short_name(name):
+    return name.split(" (")[0]
+
+
+def material_label(cfg):
+    """Ekranda/raporda kullanılan malzeme adı (hibritse karışım bileşimi)."""
+    if cfg.get("hybrid"):
+        pct = cfg["mix_pct"]
+        return f"Hibrit %{pct} {short_name(cfg['mat1'])} + %{100 - pct} {short_name(cfg['mat2'])} ({cfg['mix_basis'].lower()})"
+    return cfg["material"]
+
+
+def csp_power_mw(cfg):
+    """
+    CSP şarj gücü:  Q_solar = A_optik · DNI · η_optik   [W → MW]
+    A: toplam optik toplama alanı (m²), DNI: doğrudan normal ışınım (W/m²), η: optik verim (kesir).
+    """
+    return cfg["csp_area"] * cfg["csp_dni"] * cfg["csp_eta_pct"] / 100.0 / 1e6
+
+
+def effective_cfg(cfg):
+    """
+    Şarj kaynağına göre 'etkin' konfigürasyon. CSP'de şarj gücü Q_solar olur ve zaten ısıl güç
+    olduğundan ısıtıcı verimi uygulanmaz (η = 1). Böylece tüm model (0-D, 1-D, tarama,
+    optimizasyon) değişmeden çalışır.
+    """
+    if cfg.get("charge_src") == SRC_CSP:
+        return dict(cfg, p_heat_mw=csp_power_mw(cfg), eta_heater_pct=100.0)
+    return cfg
+
+
 # Gauss-Legendre düğümleri: düzgün integrantlar için az noktayla çok yüksek doğruluk.
 _GL_X, _GL_W = np.polynomial.legendre.leggauss(200)
 
@@ -258,9 +341,18 @@ def validate_cfg(cfg):
 def compute_system(cfg, name):
     """Bir konfigürasyonun tüm 0-D sonuçlarını tek sözlükte toplar (karşılaştırma için)."""
     c0, beta = model_params(cfg)
-    r, h = silo_geometry(cfg["volume"], cfg["h_over_r"])
+    # MODÜLER TESİS: toplam hacim N eşit siloya bölünür (aynı H/R ve yalıtım). Enerji (kütle) değişmez;
+    # ısı kaybı yüzeylerden olduğu için toplam UA = N · UA_modül büyür:
+    #     Q_kayıp = Σ U_i A_i (T − T_çevre) = N · UA(V/N) · (T − T_çevre)
+    n_mod = max(1, int(cfg.get("n_modules", 1)))
+    r, h = silo_geometry(cfg["volume"] / n_mod, cfg["h_over_r"])          # MODÜL başına geometri
     e_mwh, mass, cp_mean = stored_energy_mwh(cfg["volume"], cfg["rho"], c0, beta, cfg["t_max"], cfg["t_min"])
-    ua, u_eff, a_inner, _, _ = thermal_conductance(r, h, cfg["t_ins"], cfg["k_ins"], cfg["h_out"])
+    ua_m, u_eff, a_m, _, _ = thermal_conductance(r, h, cfg["t_ins"], cfg["k_ins"], cfg["h_out"])
+    ua, a_inner = n_mod * ua_m, n_mod * a_m
+    # Referans: aynı toplam hacmin TEK dev silo olması (N = 1)
+    r1, h1 = silo_geometry(cfg["volume"], cfg["h_over_r"])
+    ua_single, _, a_single, _, _ = thermal_conductance(r1, h1, cfg["t_ins"], cfg["k_ins"], cfg["h_out"])
+    mod_penalty_pct = (ua / ua_single - 1.0) * 100.0
 
     # Fourier ısı iletimi: Q_kayıp = U·A·(T_kum − T_çevre); şarj bitiminde T_kum = T_max → en büyük kayıp.
     q_loss_kw = ua * (cfg["t_max"] - cfg["t_env"]) / 1000.0
@@ -277,6 +369,8 @@ def compute_system(cfg, name):
         "mass_t": mass / 1000.0, "cp_mean": cp_mean, "e_mwh": e_mwh, "ua": ua, "u_eff": u_eff,
         "a_inner": a_inner, "q_loss_kw": q_loss_kw, "t_dis_h": t_dis_h, "tau_days": tau_days,
         "cool": cool, "cycle": cycle, "eta_rt_pct": eta_pct, "daily_loss_pct": daily_loss_pct,
+        "n_mod": n_mod, "v_mod": cfg["volume"] / n_mod, "ua_single": ua_single, "a_single": a_single,
+        "mod_penalty_pct": mod_penalty_pct,
         "sub": {
             "e_mwh": f"{e_mwh * 1000 / cfg['volume']:,.0f} kWh/m³ · c̄p {cp_mean:,.0f}",
             "q_loss_kw": f"%{daily_loss_pct:.2f} / gün",
@@ -388,6 +482,16 @@ def _first_crossing_down(T, z, level):
 
 def thermocline_cycle(cfg):
     """Tam çevrim: şarj → bekleme → deşarj (1-D). Sonuçlar sözlük olarak döner."""
+    n_mod = int(cfg.get("n_modules", 1))
+    if n_mod > 1:
+        # Özdeş modüller paralel çalışır: bir modülü (V/N, P/N) çöz, enerjileri N ile çarp.
+        # Süreler, yüzde oranları ve profiller modül başınadır.
+        cfg_m = dict(cfg, volume=cfg["volume"] / n_mod, p_heat_mw=cfg["p_heat_mw"] / n_mod,
+                     p_dis_mw=cfg["p_dis_mw"] / n_mod, n_modules=1)
+        res = thermocline_cycle(cfg_m)
+        res["e_in_mwh"] *= n_mod
+        res["e_out_mwh"] *= n_mod
+        return res
     S = _tc_setup(cfg, int(cfg["n_cells"]))
     N, dz, h = S["n"], S["dz"], S["h"]
     t_env, t_min, t_max = cfg["t_env"], cfg["t_min"], cfg["t_max"]
@@ -464,13 +568,14 @@ def thermocline_cooling(cfg, horizon_s):
     1-D soğuma: tam şarjlı (üniform T_max) yatağın deşarjsız soğuması.
     Uç hücrelerin (kapaklar) daha çok kaybetmesi ve eksenel iletim yakalanır.
     """
-    S = _tc_setup(cfg, 40)
+    n_mod = max(1, int(cfg.get("n_modules", 1)))
+    S = _tc_setup(dict(cfg, volume=cfg["volume"] / n_mod), 40)             # tek modül; sonuç N ile çarpılır
     n_steps = int(np.clip(horizon_s / SEC_PER_DAY, 120, 800))
     T0 = np.full(S["n"], float(cfg["t_max"]))
     loss0 = float(np.sum(S["ua_cell"] * (T0 - cfg["t_env"])))
     _, losses = _implicit_advance(T0, horizon_s, n_steps, S, cfg["t_env"])
     t = np.linspace(0.0, horizon_s, n_steps + 1)
-    return t, np.array([loss0] + losses) / 1000.0
+    return t, n_mod * np.array([loss0] + losses) / 1000.0
 
 
 def freeze(cfg):
@@ -525,7 +630,7 @@ MAIN_SPECS = [
     ("e_mwh", "⚡ Depolanan Isıl Enerji", "{:,.1f}", "MWh", "up", "Q = m·[h(T_max) − h(T_min)],  h(T) = ∫ c_p dT"),
     ("q_loss_kw", "🔥 Isı Kaybı (T_max'ta)", "{:,.1f}", "kW", "down", "Q_kayıp = U·A·(T_kum − T_çevre); şarj bitiminde (en yüksek ΔT)."),
     ("t_dis_h", "⏱️ Maks. Deşarj Süresi", "{:,.1f}", "saat", "up", "Toplam kullanılabilir enerji / deşarj gücü (kayıpsız ideal)."),
-    ("eta_rt_pct", "🔄 Round-trip Verim", "{:,.1f}", "%", "up", "Elektrik → ısı → ısı: şarj + bekleme + deşarj kayıpları dahil (0-D model)."),
+    ("eta_rt_pct", "🔄 Round-trip Verim", "{:,.1f}", "%", "up", "Şarj girdisi (elektrik veya CSP'de toplanan güneş ısısı) → verilen ısı; şarj + bekleme + deşarj kayıpları dahil (0-D model)."),
 ]
 DERIVED_SPECS = [
     ("r", "Silo yarıçapı", "{:,.2f}", "m", "neutral", "R = [V / (π·H/R)]^(1/3)"),
@@ -599,10 +704,10 @@ def sanitize_cfg(raw):
             continue
         v, d = raw[k], DEFAULT_CFG[k]
         try:
-            if k == "material":
-                v = v if v in MATERIALS else d
-            elif k == "cp_mode":
-                v = v if v in (CP_CONST, CP_VAR) else d
+            if k in CATEGORICAL:
+                v = v if v in CATEGORICAL[k] else d
+            elif k == "hybrid":
+                v = bool(v)
             else:
                 v = float(v)
                 if not math.isfinite(v):
@@ -613,6 +718,9 @@ def sanitize_cfg(raw):
         except (TypeError, ValueError):
             v = d
         cfg[k] = v
+    if cfg["hybrid"]:   # hibritte ρ ve c_p daima bileşenlerden yeniden hesaplanır (tutarlılık)
+        comp = composite_props(cfg["mat1"], cfg["mat2"], cfg["mix_pct"], cfg["mix_basis"])
+        cfg.update({kk: comp[kk] for kk in ("rho", "cp", "cp25", "beta")})
     return cfg
 
 
@@ -667,13 +775,14 @@ def design_objective(volume, hr, t, base, objective, prices):
     """
     hr = np.asarray(hr, dtype=float)
     t = np.asarray(t, dtype=float)
-    r = (volume / (np.pi * hr)) ** (1.0 / 3.0)
+    n_mod = max(1, int(base.get("n_modules", 1)))
+    r = (volume / n_mod / (np.pi * hr)) ** (1.0 / 3.0)               # her modülün yarıçapı
     h = hr * r
-    ua = ua_vec(r, h, t, base["k_ins"], base["h_out"])
+    ua = n_mod * ua_vec(r, h, t, base["k_ins"], base["h_out"])      # N modülün toplam UA'sı
     d_env = base["t_max"] - base["t_env"]
     feasible = base["eta_heater_pct"] / 100.0 * base["p_heat_mw"] * 1e6 > ua * d_env * 1.000001
     q_loss_kw = ua * d_env / 1000.0
-    v_ins = np.pi * (r + t) ** 2 * (h + 2.0 * t) - np.pi * r ** 2 * h
+    v_ins = n_mod * (np.pi * (r + t) ** 2 * (h + 2.0 * t) - np.pi * r ** 2 * h)
     t_avg = 0.5 * (base["t_max"] + base["t_min"])
     e_year_mwh = ua * (t_avg - base["t_env"]) * 8760.0 / 1e6
     cost = prices["ins"] * v_ins + prices["energy"] * e_year_mwh * prices["years"]
@@ -760,18 +869,34 @@ def build_report(systems, tcs, opt=None):
             cp_rows.append(("Ortalama özgül ısı c_p", f"{c['cp']:,.0f}", "J/(kg·K)"))
         else:
             cp_rows += [("c_p,25 (25 °C'de)", f"{c['cp25']:,.0f}", "J/(kg·K)"), ("β", f"{c['beta']:.2f}", "J/(kg·K²)")]
+        ci = s.get("cfg_in", c)
+        if ci["charge_src"] == SRC_CSP:
+            src_rows = [("Şarj kaynağı", SRC_CSP, "–"),
+                        ("Toplam optik toplama alanı", f"{ci['csp_area']:,.0f}", "m²"),
+                        ("DNI", f"{ci['csp_dni']:,.0f}", "W/m²"), ("Optik verim", f"{ci['csp_eta_pct']:.1f}", "%"),
+                        ("Hesaplanan şarj gücü Q_solar = A·DNI·η", f"{c['p_heat_mw']:.2f}", "MW")]
+        else:
+            src_rows = [("Şarj kaynağı", SRC_ELEC, "–"), ("Isıtıcı gücü", f"{c['p_heat_mw']:.2f}", "MW"),
+                        ("Isıtıcı verimi", f"{c['eta_heater_pct']:.1f}", "%")]
+        hyb_rows = []
+        if c["hybrid"]:
+            hyb_rows = [("Hibrit karışım", f"%{c['mix_pct']} {c['mat1']} + %{100 - c['mix_pct']} {c['mat2']}", "–"),
+                        ("Karışım oranı tabanı", c["mix_basis"], "–")]
         L += [f"## {i}. Sistem: {s['name']}", "", "### 1. Girdi parametreleri", "", tbl([
             ("Kum hacmi V", f"{c['volume']:,.1f}", "m³"), ("H/R oranı", f"{c['h_over_r']:.2f}", "–"),
-            ("Malzeme", c["material"], "–"), ("Yığın yoğunluğu ρ", f"{c['rho']:,.0f}", "kg/m³"), *cp_rows,
+            ("Malzeme", material_label(c), "–"), ("Yığın yoğunluğu ρ", f"{c['rho']:,.0f}", "kg/m³"), *cp_rows, *hyb_rows,
             ("T_max", f"{c['t_max']}", "°C"), ("T_min", f"{c['t_min']}", "°C"), ("T_çevre", f"{c['t_env']}", "°C"),
             ("Yalıtım kalınlığı t", f"{c['t_ins']:.2f}", "m"), ("Yalıtım iletkenliği k", f"{c['k_ins']:.3f}", "W/(m·K)"),
-            ("Isıtıcı gücü", f"{c['p_heat_mw']:.2f}", "MW"), ("Deşarj gücü", f"{c['p_dis_mw']:.2f}", "MW"),
-            ("Isıtıcı verimi", f"{c['eta_heater_pct']:.1f}", "%"), ("Dış taşınım katsayısı h_dış", f"{c['h_out']:.1f}", "W/(m²·K)"),
+            *src_rows, ("Deşarj gücü", f"{c['p_dis_mw']:.2f}", "MW"),
+            ("Silo modül sayısı N", f"{s['n_mod']}", "adet"),
+            ("Dış taşınım katsayısı h_dış", f"{c['h_out']:.1f}", "W/(m²·K)"),
             ("Bekleme süresi", f"{c['hold_days']:.1f}", "gün"), ("1-D hücre sayısı N", f"{c['n_cells']}", "–"),
             ("Efektif eksenel iletkenlik k_eff", f"{c['k_eff']:.2f}", "W/(m·K)"),
             ("Şarj / deşarj kesme eşiği", f"%{c['cut_ch_pct']} / %{c['cut_dis_pct']}", "ΔT"),
         ]), "", "### 2. Geometri ve ısıl özellikler", "", tbl([
-            ("Silo yarıçapı R", f"{s['r']:.2f}", "m"), ("Silo yüksekliği H", f"{s['h']:.2f}", "m"),
+            ("Modül başına hacim V/N", f"{s['v_mod']:,.1f}", "m³"),
+            ("Silo (modül) yarıçapı R", f"{s['r']:.2f}", "m"), ("Silo (modül) yüksekliği H", f"{s['h']:.2f}", "m"),
+            ("Tek dev siloya göre ısı kaybı artışı", f"{s['mod_penalty_pct']:.1f}", "%"),
             ("Kum kütlesi m", f"{s['mass_t']:,.0f}", "ton"), ("Ortalama özgül ısı c̄_p", f"{s['cp_mean']:,.0f}", "J/(kg·K)"),
             ("İç yüzey alanı", f"{s['a_inner']:,.0f}", "m²"), ("Toplam ısıl iletkenlik UA", f"{s['ua']:,.1f}", "W/K"),
             ("Eşdeğer U", f"{s['u_eff']:.3f}", "W/(m²·K)"), ("Zaman sabiti τ", f"{s['tau_days']:,.0f}", "gün"),
@@ -784,12 +909,12 @@ def build_report(systems, tcs, opt=None):
             ("Round-trip verim", f"{s['eta_rt_pct']:.1f}" if cy else "hesaplanamadı", "%"),
             ("Şarj süresi", f"{cy['t_charge_h']:,.1f}" if cy else "—", "saat"),
             ("Gerçek deşarj süresi", f"{cy['t_discharge_h']:,.1f}" if cy else "—", "saat"),
-            ("Çekilen elektrik", f"{cy['e_in_mwh']:,.1f}" if cy else "—", "MWh"),
+            ("Şarj girdi enerjisi", f"{cy['e_in_mwh']:,.1f}" if cy else "—", "MWh"),
             ("Verilen ısı", f"{cy['e_out_mwh']:,.1f}" if cy else "—", "MWh"),
         ]), "", "### 4. 1-D termoklin sonuçları", "", tbl([
             ("Kapasite kullanımı", f"{tc['util_pct']:.1f}", "%"), ("1-D round-trip verim", f"{tc['eta_pct']:.1f}", "%"),
             ("Şarj süresi", f"{tc['t_charge_h']:,.1f}", "saat"), ("Gerçek deşarj süresi", f"{tc['t_dis_h']:,.1f}", "saat"),
-            ("Çekilen elektrik", f"{tc['e_in_mwh']:,.1f}", "MWh"), ("Verilen ısı", f"{tc['e_out_mwh']:,.1f}", "MWh"),
+            ("Şarj girdi enerjisi", f"{tc['e_in_mwh']:,.1f}", "MWh"), ("Verilen ısı", f"{tc['e_out_mwh']:,.1f}", "MWh"),
             ("Termoklin kalınlığı (%50 deşarjda)", f"{tc['thick_m']:.2f}" if is_num(tc["thick_m"]) else "—", "m"),
         ]), "", "### 5. Deşarjsız bekleme (soğuma)", "",
             "| Süre (ay) | Kum sıcaklığı (°C) | Isı kaybı (kW) | Kalan faydalı enerji (%) |\n|--:|--:|--:|--:|"]
@@ -815,10 +940,131 @@ def build_report(systems, tcs, opt=None):
     L += ["---", "## Model varsayımları (özet)", "",
           "- 0-D toplu kapasite modeli ve 1-D LTE termoklin modeli (MUSCL + SSP-RK2) birlikte kullanılmıştır.",
           "- c_p sabit veya c_p(T) = c_p,25 + β(T − 25); enerji entalpi farkından hesaplanır.",
-          "- Isı kaybı: silindirik radyal iletim + düz kapaklar + dış film direnci; yalıtım k değeri sabittir.",
+          "- Isı kaybı: silindirik radyal iletim + düz kapaklar + dış film direnci; yalıtım k değeri sabittir. Modüler tesiste toplam UA = N·UA(V/N).",
+          "- Hibrit yatakta ρ ve c_p ağırlıklı ortalamayla (ideal karışım) hesaplanır; CSP'de şarj gücü Q_solar = A·DNI·η sabit kabul edilir.",
           "- Round-trip verim elektrik → ısı → ısı verimidir (ısıdan elektriğe dönüşüm dahil değildir).",
           "- Ön tasarım aracıdır; ayrıntılı tasarım için CFD veya iki-fazlı yatak modelleri gerekir.", ""]
     return "\n".join(L)
+
+
+# =============================================================================
+# 3c) 3D TESİS TASARIMI: ağ (mesh) üretimi ve modüler trade-off
+# =============================================================================
+MAT_COLORS = {"Silika Kumu (Kuvars)": "#e9c46a", "Bazalt (kırma)": "#475569",
+              "Refrakter (şamot, kırma)": "#c2410c", "Manuel Giriş": "#8b5cf6"}
+
+
+def cylinder_mesh(cx, cy, r, z0, z1, n_seg=36):
+    """
+    Kapalı bir silindirin üçgen ağı (Plotly Mesh3d için x, y, z, i, j, k).
+    Yan yüz ve kapaklar ayrı köşe kümeleri kullanır → kenarlar keskin, ışıklandırma doğru olur.
+    Üçgen sıralaması dışa bakan normal verecek şekildedir.
+    """
+    n = n_seg
+    th = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
+    rx, ry = cx + r * np.cos(th), cy + r * np.sin(th)
+    x = np.concatenate([rx, rx, rx, rx, [cx, cx]])
+    y = np.concatenate([ry, ry, ry, ry, [cy, cy]])
+    z = np.concatenate([np.full(n, z0), np.full(n, z1), np.full(n, z0), np.full(n, z1), [z0, z1]])
+    a = np.arange(n)
+    b = (a + 1) % n
+    I = np.concatenate([a, b, np.full(n, 4 * n), np.full(n, 4 * n + 1)])
+    J = np.concatenate([b, n + b, 2 * n + b, 3 * n + a])
+    K = np.concatenate([n + a, n + a, 2 * n + a, 3 * n + b])
+    return x, y, z, I, J, K
+
+
+def merge_meshes(parts):
+    """Birçok silindiri tek Mesh3d izinde birleştirir (köşe indeksleri ötelenir)."""
+    xs, ys, zs, Is, Js, Ks, off = [], [], [], [], [], [], 0
+    for x, y, z, I, J, K in parts:
+        xs.append(x); ys.append(y); zs.append(z)
+        Is.append(I + off); Js.append(J + off); Ks.append(K + off)
+        off += x.size
+    return (np.concatenate(xs), np.concatenate(ys), np.concatenate(zs),
+            np.concatenate(Is), np.concatenate(Js), np.concatenate(Ks))
+
+
+def build_plant_figure(res, show_ins=True, n_pairs=3):
+    """
+    N adet modüler siloyu ızgara düzeninde çizer. Hibritte her silo, Malzeme 1 ve Malzeme 2'nin
+    hacim oranına göre yüksekliği bölünmüş ALTERNATİF KATMANLAR (n_pairs çift) olarak renklendirilir.
+    Silindir kesiti sabit olduğundan hacim kesri = yükseklik kesridir.
+    Dönüş: (figür, silo aralığı, sütun sayısı, satır sayısı, saha genişliği, saha derinliği)
+    """
+    cfg, n, r, h = res["cfg"], res["n_mod"], res["r"], res["h"]
+    t = cfg["t_ins"]
+    pitch = 2.0 * (r + t) + max(0.35 * (r + t), 0.5)
+    cols = math.ceil(math.sqrt(n))
+    rows = math.ceil(n / cols)
+    centers = [((i % cols) * pitch, (i // cols) * pitch) for i in range(n)]
+
+    if cfg["hybrid"]:
+        phi1 = composite_props(cfg["mat1"], cfg["mat2"], cfg["mix_pct"], cfg["mix_basis"])["phi1"]
+        layers, z = [], 0.0
+        for _ in range(n_pairs):
+            for mname, frac in ((cfg["mat1"], phi1), (cfg["mat2"], 1.0 - phi1)):
+                dz = h * frac / n_pairs
+                if dz > 1e-9:
+                    layers.append((mname, z, z + dz))
+                    z += dz
+        legend = {cfg["mat1"]: f"{cfg['mat1']} — hacimce %{phi1 * 100:.0f}",
+                  cfg["mat2"]: f"{cfg['mat2']} — hacimce %{(1 - phi1) * 100:.0f}"}
+    else:
+        layers = [(cfg["material"], 0.0, h)]
+        legend = {cfg["material"]: cfg["material"]}
+
+    groups = {}
+    for cx, cy in centers:
+        for mname, z0, z1 in layers:
+            groups.setdefault(mname, []).append(cylinder_mesh(cx, cy, r, z0, z1))
+
+    fig = go.Figure()
+    light = dict(ambient=0.55, diffuse=0.9, specular=0.15, roughness=0.6)
+    for mname, parts in groups.items():
+        x, y, z, I, J, K = merge_meshes(parts)
+        fig.add_trace(go.Mesh3d(x=x, y=y, z=z, i=I, j=J, k=K, color=MAT_COLORS.get(mname, "#8b5cf6"),
+                                opacity=1.0, flatshading=False, lighting=light, name=legend.get(mname, mname),
+                                showlegend=True, hoverinfo="name"))
+    if show_ins:
+        x, y, z, I, J, K = merge_meshes([cylinder_mesh(cx, cy, r + t, -t, h + t) for cx, cy in centers])
+        fig.add_trace(go.Mesh3d(x=x, y=y, z=z, i=I, j=J, k=K, color="#cbd5e1", opacity=0.16, flatshading=False,
+                                name=f"Yalıtım (t = {t:.2f} m)", showlegend=True, hoverinfo="name"))
+    # Zemin levhası
+    m = 0.6 * pitch
+    gx = [-m, (cols - 1) * pitch + m, (cols - 1) * pitch + m, -m]
+    gy = [-m, -m, (rows - 1) * pitch + m, (rows - 1) * pitch + m]
+    fig.add_trace(go.Mesh3d(x=gx, y=gy, z=[-t - 0.02 * h] * 4, i=[0, 0], j=[1, 2], k=[2, 3], color="#94a3b8",
+                            opacity=0.35, name="Zemin", showlegend=False, hoverinfo="skip"))
+    fig.update_layout(
+        height=620, margin=dict(l=0, r=0, t=50, b=0), paper_bgcolor="rgba(0,0,0,0)",
+        title=dict(text=f"{n} × silo · her biri {res['v_mod']:,.0f} m³ (R = {r:.1f} m, H = {h:.1f} m)", font=dict(size=18)),
+        legend=dict(orientation="h", yanchor="bottom", y=0.0, xanchor="left", x=0.0),
+        scene=dict(aspectmode="data", camera=dict(eye=dict(x=1.5, y=-1.7, z=0.9)),
+                   xaxis=dict(title="x (m)", showbackground=False), yaxis=dict(title="y (m)", showbackground=False),
+                   zaxis=dict(title="z (m)", showbackground=False)))
+    width = (cols - 1) * pitch + 2.0 * (r + t)
+    depth = (rows - 1) * pitch + 2.0 * (r + t)
+    return fig, pitch, cols, rows, width, depth
+
+
+def modular_curve(cfg, n_max=20):
+    """N = 1…n_max için toplam ısı kaybı (kW, T_max'ta) ve tek siloya göre artış (%)."""
+    ns = np.arange(1, n_max + 1)
+    r = (cfg["volume"] / ns / (np.pi * cfg["h_over_r"])) ** (1.0 / 3.0)
+    ua = ns * ua_vec(r, cfg["h_over_r"] * r, cfg["t_ins"], cfg["k_ins"], cfg["h_out"])
+    q = ua * (cfg["t_max"] - cfg["t_env"]) / 1000.0
+    return ns, q, (ua / ua[0] - 1.0) * 100.0
+
+
+def trade_off_text(n, x_pct):
+    """Modül sayısına göre dinamik mühendislik analizi metni."""
+    if n == 1:
+        return ("Mühendislik Analizi: Tek Dev Silo. Avantaj: Minimum yüzey alanı ve en düşük ısı kaybı. "
+                "Dezavantaj: Yüksek inşaat zorluğu, artan rüzgar yükü ve termal gerilme.")
+    return (f"Mühendislik Analizi: Modüler Tesis ({n} adet). Avantaj: Kolay ve ucuz inşaat, düşük rüzgar yükü, "
+            f"yüksek operasyonel esneklik (bir modül bozulursa diğerleri çalışır). "
+            f"Dezavantaj: Artan toplam yüzey alanı nedeniyle %{x_pct:.1f} oranında daha yüksek ısı kaybı.")
 
 
 # =============================================================================
@@ -852,7 +1098,7 @@ st.markdown(
     """
     <div class="hero">
         <h1>🏖️ Termal Kum Bataryası — Parametrik Tasarım ve Simülasyon</h1>
-        <p>Duyulur ısı depolama · c_p(T) · Fourier ısı iletimi · Newton soğuma · 1-D termoklin</p>
+        <p>Duyulur ısı depolama · c_p(T) · Fourier ısı iletimi · Newton soğuma · 1-D termoklin · hibrit yatak · CSP · modüler tesis</p>
     </div>
     """,
     unsafe_allow_html=True,
@@ -866,6 +1112,10 @@ st.markdown(
 # doğrudan değiştirebilir.
 for _k, _v in DEFAULT_CFG.items():
     st.session_state.setdefault(_k, _v)
+# Koşullu gizlenen widget'ların (ısıtıcı gücü / CSP alanları) değeri, widget çizilmediği
+# çalıştırmalarda silinmesin diye burada yeniden atanır (Streamlit widget temizliğini engeller).
+for _k in ("p_heat_mw", "csp_area", "csp_dni", "csp_eta_pct"):
+    st.session_state[_k] = st.session_state[_k]
 st.session_state.setdefault("horizon_months", 12)
 st.session_state.setdefault("show_1d_cooling", True)
 st.session_state.setdefault("uploader_n", 0)
@@ -884,12 +1134,24 @@ if "saved_configs" not in st.session_state:
     }
 
 
-def on_material_change():
-    """Hazır malzeme seçilince ρ, c_p, c_p,25 ve β değerlerini preset'ten doldurur."""
-    p = MATERIALS[st.session_state["material"]]
-    if st.session_state["material"] != "Manuel Giriş":
-        for k in ("rho", "cp", "cp25", "beta"):
-            st.session_state[k] = p[k]
+def sync_material_props():
+    """
+    Malzeme girdilerini tek yerden senkronlar:
+      • Hibrit mod açıksa ρ, c_p, c_p,25, β kompozit (ağırlıklı ortalama) değerlere ayarlanır.
+      • Değilse hazır malzeme seçilince preset değerleri doldurulur (Manuel'de kullanıcı değerleri korunur).
+    """
+    ss = st.session_state
+    if ss["hybrid"]:
+        p = composite_props(ss["mat1"], ss["mat2"], ss["mix_pct"], ss["mix_basis"])
+    elif ss["material"] != "Manuel Giriş":
+        p = MATERIALS[ss["material"]]
+    else:
+        return
+    for k in ("rho", "cp", "cp25", "beta"):
+        ss[k] = float(p[k])
+
+
+on_material_change = sync_material_props
 
 
 def save_config():
@@ -988,10 +1250,31 @@ sb.slider("Yükseklik / Yarıçap oranı (H/R)", 0.5, 8.0, step=0.1, key="h_over
           help="Kapalı silindirde yüzey alanı (dolayısıyla ısı kaybı) H/R = 2 iken minimumdur. "
                "Uzun-ince silolar termal katmanlaşma açısından avantajlıdır.")
 
+sb.slider("Silo Modül Sayısı (N)", 1, 20, key="n_modules",
+          help="Toplam hacim V, N eşit siloya bölünür. Yüzey alanı arttığı için ısı kaybı büyür; "
+               "inşaat ve işletme esnekliği artar. Ayrıntı için '3D Tesis Tasarımı' sekmesine bakın.")
+if st.session_state["n_modules"] > 1:
+    sb.caption(f"Her modül: {st.session_state['volume'] / st.session_state['n_modules']:,.0f} m³ "
+               f"({st.session_state['n_modules']} adet)")
+
 # ---- Malzeme ---------------------------------------------------------------
 sb.subheader("🪨 Depolama Malzemesi")
-sb.selectbox("Malzeme", list(MATERIALS.keys()), key="material", on_change=on_material_change)
-is_manual = st.session_state["material"] == "Manuel Giriş"
+sb.selectbox("Malzeme", list(MATERIALS.keys()), key="material", on_change=sync_material_props,
+             disabled=bool(st.session_state["hybrid"]))
+sb.toggle("🧪 Hibrit Karışım Modu", key="hybrid", on_change=sync_material_props,
+          help="İki malzemeyi seçilen oranda karıştırır; ρ ve c_p ağırlıklı ortalamayla hesaplanıp tüm denklemlere beslenir.")
+with sb.expander("Hibrit karışım ayarları", expanded=bool(st.session_state["hybrid"])):
+    st.selectbox("Malzeme 1", PRESET_NAMES, key="mat1", on_change=sync_material_props)
+    st.selectbox("Malzeme 2", PRESET_NAMES, key="mat2", on_change=sync_material_props)
+    st.slider("Malzeme 1 oranı (%)", 0, 100, step=5, key="mix_pct", on_change=sync_material_props,
+              help="Malzeme 2 oranı = 100 − Malzeme 1 oranı.")
+    st.radio("Oran tabanı", [MIX_VOL, MIX_MASS], horizontal=True, key="mix_basis", on_change=sync_material_props,
+             help="Hacimce: ρ hacim ağırlıklı ortalama. Kütlece: ρ harmonik ortalama. c_p her iki durumda kütle ağırlıklı ortalamadır.")
+    _mix = composite_props(st.session_state["mat1"], st.session_state["mat2"],
+                           st.session_state["mix_pct"], st.session_state["mix_basis"])
+    st.caption(f"Kompozit: ρ = {_mix['rho']:,.0f} kg/m³ · c̄_p = {_mix['cp']:,.0f} J/kg·K · "
+               f"M1 kütle kesri %{_mix['w1'] * 100:.0f}" + ("" if st.session_state["hybrid"] else "  (mod kapalı)"))
+is_manual = (st.session_state["material"] == "Manuel Giriş") and not st.session_state["hybrid"]
 sb.number_input("Yığın yoğunluğu ρ (kg/m³)", 500.0, 5000.0, step=10.0, key="rho", disabled=not is_manual,
                 help="Boşluklu yatağın yığın yoğunluğu (tanecik yoğunluğu × (1 − porozite)).")
 sb.radio("Özgül ısı modeli", [CP_CONST, CP_VAR], key="cp_mode",
@@ -1018,12 +1301,25 @@ sb.number_input("Yalıtım ısıl iletkenliği k (W/m·K)", 0.015, 1.0, step=0.0
 
 # ---- Sistem güçleri --------------------------------------------------------
 sb.subheader("🔌 Sistem Güçleri")
-sb.number_input("Isıtıcı rezistans gücü (MW)", 0.1, 100.0, step=0.5, key="p_heat_mw")
+sb.radio("Şarj kaynağı", [SRC_ELEC, SRC_CSP], key="charge_src",
+         help="CSP seçilirse şarj gücü Q_solar = A·DNI·η_optik formülüyle hesaplanır (sabit DNI, kesintisiz şarj).")
+if st.session_state["charge_src"] == SRC_ELEC:
+    sb.number_input("Isıtıcı rezistans gücü (MW)", 0.1, 100.0, step=0.5, key="p_heat_mw")
+else:
+    sb.number_input("Toplam optik toplama alanı (m²)", 100.0, 1000000.0, step=500.0, key="csp_area",
+                    help="Fresnel lens / helyostat sahasının toplam optik açıklık alanı.")
+    sb.number_input("DNI (W/m²)", 100.0, 1400.0, step=10.0, key="csp_dni",
+                    help="Doğrudan normal ışınım. Tipik tasarım değeri 700–950 W/m².")
+    sb.slider("Optik verim (%)", 10.0, 95.0, step=0.5, key="csp_eta_pct",
+              help="Yansıtma, gölgeleme, blokaj ve alıcı kayıplarını içeren toplam optik verim.")
+    sb.caption(f"☀️ Q_solar = A · DNI · η = **{csp_power_mw(st.session_state):.2f} MW**")
 sb.number_input("Eşanjör deşarj gücü (MW)", 0.1, 100.0, step=0.5, key="p_dis_mw")
 
 # ---- Gelişmiş --------------------------------------------------------------
 with sb.expander("🔬 Gelişmiş ayarlar"):
-    st.slider("Isıtıcı verimi (%)", 90.0, 100.0, step=0.5, key="eta_heater_pct")
+    st.slider("Isıtıcı verimi (%)", 90.0, 100.0, step=0.5, key="eta_heater_pct",
+              disabled=st.session_state["charge_src"] == SRC_CSP,
+              help="Yalnızca elektrikli rezistans için; CSP'de optik verim kullanılır.")
     st.number_input("Dış yüzey ısı taşınım katsayısı h_dış (W/m²·K)", 3.0, 50.0, step=1.0, key="h_out",
                     help="Doğal konveksiyon + ışınım için tipik 8–15 W/m²K.")
     st.number_input("Şarj–deşarj arası bekleme süresi (gün)", 0.0, 365.0, step=1.0, key="hold_days")
@@ -1072,20 +1368,22 @@ else:
 
 systems = []
 for pick, _tag in picks:
-    cfg = cfg_cur if pick == CUR else saved[pick]
-    label = f"Mevcut ({cfg['material']})" if pick == CUR else pick
+    cfg = dict(DEFAULT_CFG, **(cfg_cur if pick == CUR else saved[pick]))   # eksik anahtarlara karşı güvenli
+    label = f"Mevcut ({material_label(cfg)})" if pick == CUR else pick
     err = validate_cfg(cfg)
     if err:
         st.error(f"{label}: {err}")
         st.stop()
-    systems.append(compute_system(cfg, label))
+    sys_ = compute_system(effective_cfg(cfg), label)      # CSP ise şarj gücü Q_solar'dan gelir
+    sys_["cfg_in"] = cfg                                  # kullanıcı girdileri (rapor için)
+    systems.append(sys_)
 
 horizon_months = st.session_state["horizon_months"]
 show_1d_cool = st.session_state["show_1d_cooling"]
 tcs = [tc_cycle_cached(freeze(s["cfg"])) for s in systems]
 
 # Optimizasyon: rapor ve sekme aynı (güncel) sonucu kullansın diye burada, sekmelerden önce çözülür.
-opt = compute_optimization(cfg_cur)
+opt = compute_optimization(effective_cfg(cfg_cur))
 st.session_state["opt_result"] = opt if not opt.get("error") else None
 
 # ---- Rapor (Markdown / TXT) ----
@@ -1109,31 +1407,38 @@ if not compare:
     render_cards(s0, None, MAIN_SPECS, 4)
     st.markdown('<div class="section-title">Türetilmiş tasarım büyüklükleri</div>', unsafe_allow_html=True)
     render_cards(s0, None, DERIVED_SPECS, 6)
+    if s0["n_mod"] > 1:
+        st.caption(f"ℹ️ Silo boyutları, yüzey alanı ve U **modül başınadır** ({s0['n_mod']} × {s0['v_mod']:,.0f} m³). "
+                   f"Isı kaybı toplam yüzey nedeniyle tek dev siloya göre %{s0['mod_penalty_pct']:.1f} daha yüksektir.")
 else:
     col_a, col_b = st.columns(2)
     with col_a:
         st.markdown(f'<span class="sys-badge">🅰️ {systems[0]["name"]} — referans</span>', unsafe_allow_html=True)
         render_cards(systems[0], None, MAIN_SPECS, 2)
         render_cards(systems[0], None, DERIVED_SPECS, 3)
+        if systems[0]["n_mod"] > 1:
+            st.caption(f"ℹ️ {systems[0]['n_mod']} modül · boyutlar modül başına · tek silo referansına göre kayıp +%{systems[0]['mod_penalty_pct']:.1f}")
     with col_b:
         st.markdown(f'<span class="sys-badge">🅱️ {systems[1]["name"]} — Δ = B − A</span>', unsafe_allow_html=True)
         render_cards(systems[1], systems[0], MAIN_SPECS, 2)
         render_cards(systems[1], systems[0], DERIVED_SPECS, 3)
+        if systems[1]["n_mod"] > 1:
+            st.caption(f"ℹ️ {systems[1]['n_mod']} modül · boyutlar modül başına · tek silo referansına göre kayıp +%{systems[1]['mod_penalty_pct']:.1f}")
     st.caption("Delta renkleri mühendislik yönüne göre: enerji, süre ve verimde artış yeşil; "
                "ısı kaybı ve eşdeğer U'da artış kırmızıdır.")
 
 for s in systems:
     if s["cycle"] is None:
-        st.error(f"⚠️ {s['name']}: Isıtıcı gücü, T_max sıcaklığındaki ısı kaybını karşılayamıyor; "
-                 "sistem hedef sıcaklığa ulaşamaz. Isıtıcı gücünü artırın veya yalıtımı iyileştirin.")
+        st.error(f"⚠️ {s['name']}: Şarj gücü (ısıtıcı veya CSP), T_max sıcaklığındaki ısı kaybını karşılayamıyor; "
+                 "sistem hedef sıcaklığa ulaşamaz. Şarj gücünü artırın veya yalıtımı iyileştirin.")
 
 st.write("")
 
 # =============================================================================
 # 9) SEKMELER
 # =============================================================================
-tab_graph, tab_tc, tab_sweep, tab_opt, tab_eq, tab_data = st.tabs(
-    ["📊 Grafikler", "🌡️ Termoklin (1-D)", "📈 Analiz", "🎯 Optimizasyon",
+tab_graph, tab_tc, tab_sweep, tab_opt, tab_3d, tab_eq, tab_data = st.tabs(
+    ["📊 Grafikler", "🌡️ Termoklin (1-D)", "📈 Analiz", "🎯 Optimizasyon", "🏗️ 3D Tesis Tasarımı",
      "🧮 Denklemler ve Varsayımlar", "📋 Veri & İndirme"])
 
 # Ortak zaman ekseni (soğuma) ve sistem renkleri
@@ -1168,16 +1473,16 @@ with tab_graph:
         for name in PRESET_NAMES:
             p = MATERIALS[name]
             c0p, bp = (p["cp"], 0.0) if cfg0["cp_mode"] == CP_CONST else (p["cp25"], p["beta"])
-            sel = name == cfg0["material"]
+            sel = (name == cfg0["material"]) and not cfg0["hybrid"]
             fig1.add_trace(go.Scatter(
                 x=v_axis, y=e_curve(p["rho"], c0p, bp, cfg0["t_max"], cfg0["t_min"]), mode="lines", name=name,
                 line=dict(width=4 if sel else 2, color=ORANGE if sel else GRAY, dash="solid" if sel else "dot"),
                 opacity=1.0 if sel else 0.7,
                 hovertemplate="V = %{x:,.0f} m³<br>E = %{y:,.1f} MWh<extra>" + name + "</extra>"))
-        if cfg0["material"] == "Manuel Giriş":
+        if cfg0["hybrid"] or cfg0["material"] == "Manuel Giriş":
             fig1.add_trace(go.Scatter(
                 x=v_axis, y=e_curve(cfg0["rho"], s0["c0"], s0["beta"], cfg0["t_max"], cfg0["t_min"]),
-                mode="lines", name="Manuel Giriş", line=dict(width=4, color=ORANGE)))
+                mode="lines", name=material_label(cfg0), line=dict(width=4, color=ORANGE)))
         marks = [(s0, BLUE, "Mevcut tasarım")]
     else:
         for s, colr in zip(systems, sys_colors):
@@ -1443,6 +1748,56 @@ with tab_opt:
         wide_call(st.button, "✅ Optimumu yan menü girdilerine uygula", on_click=apply_opt, key="btn_apply_opt",
                   disabled=not opt["volume_ok"])
 
+# ------------------------- 3D TESİS TASARIMI -----------------------------------
+with tab_3d:
+    st.markdown(
+        "Tek dev silo mu, yoksa çok modüllü bir **batarya tarlası** mı? Yan menüdeki **Silo Modül Sayısı (N)** "
+        "toplam hacmi N eşit siloya böler (aynı H/R ve yalıtım). Enerji değişmez; toplam dış yüzey alanı "
+        "arttığı için ısı kaybı büyür.")
+    idx3 = 0
+    if compare:
+        idx3 = 0 if st.radio("Gösterilen sistem", ["A", "B"], horizontal=True, key="v3d_sys") == "A" else 1
+    s3 = systems[idx3]
+    c3, n3 = s3["cfg"], s3["n_mod"]
+    show_ins = st.checkbox("Yalıtım katmanını göster", value=True, key="v3d_ins")
+    fig3d, pitch3, cols3, rows3, width3, depth3 = build_plant_figure(s3, show_ins)
+    wide_call(st.plotly_chart, fig3d, key="fig_3d")
+    if c3["hybrid"]:
+        st.caption("Görselleştirme: hibrit karışımın alternatif katman gösterimi (3 çift; kalınlıklar hacim oranına göre). "
+                   "Hesaplar homojen karışım varsayar.")
+
+    # ---- Dinamik mühendislik analizi (trade-off) ----
+    msg = trade_off_text(n3, s3["mod_penalty_pct"])
+    (st.success if n3 == 1 else st.info)(msg)
+
+    # ---- Sayısal özet ----
+    ns_, q_curve, inc_curve = modular_curve(c3)
+    q_single = float(q_curve[0])
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Modül sayısı × hacim", f"{n3} × {s3['v_mod']:,.0f} m³")
+    k2.metric("Toplam iç yüzey alanı", f"{s3['a_inner']:,.0f} m²",
+              delta=(f"{s3['a_inner'] - s3['a_single']:+,.0f} m² (tek siloya göre)" if n3 > 1 else None),
+              delta_color="inverse", help="A_toplam = N · (2πRH + 2πR²), R ve H modül boyutlarıdır.")
+    k3.metric("Isı kaybı (T_max'ta)", f"{s3['q_loss_kw']:,.1f} kW",
+              delta=(f"{s3['q_loss_kw'] - q_single:+,.1f} kW · %{s3['mod_penalty_pct']:.1f}" if n3 > 1 else None),
+              delta_color="inverse", help="Q_kayıp = N · UA(V/N) · (T_max − T_çevre)")
+    k4.metric("Saha ayak izi (yaklaşık)", f"{width3 * depth3:,.0f} m²",
+              help=f"{cols3} × {rows3} ızgara, silo merkez aralığı {pitch3:.1f} m.")
+
+    # ---- Trade-off eğrisi: ısı kaybı vs modül sayısı ----
+    fig_n = make_subplots(specs=[[{"secondary_y": True}]])
+    fig_n.add_trace(go.Bar(x=ns_, y=q_curve, name="Isı kaybı (kW)",
+                           marker_color=[ORANGE if int(n_) == n3 else "rgba(148,163,184,0.55)" for n_ in ns_],
+                           hovertemplate="N = %{x}<br>%{y:,.1f} kW<extra></extra>"), secondary_y=False)
+    fig_n.add_trace(go.Scatter(x=ns_, y=inc_curve, name="Tek siloya göre artış (%)", mode="lines+markers",
+                               line=dict(color=BLUE, width=3), hovertemplate="N = %{x}<br>+%{y:.1f} %<extra></extra>"),
+                    secondary_y=True)
+    fig_n.update_xaxes(title="Silo modül sayısı N", dtick=1)
+    fig_n.update_yaxes(title_text="Isı kaybı (kW, T_max'ta)", secondary_y=False)
+    fig_n.update_yaxes(title_text="Artış (%)", secondary_y=True, showgrid=False)
+    style_fig(fig_n, f"Trade-off: modül sayısı vs. ısı kaybı (V = {c3['volume']:,.0f} m³ sabit)", height=400)
+    wide_call(st.plotly_chart, fig_n, key="fig_modular")
+
 # ------------------------- DENKLEMLER ---------------------------------------
 with tab_eq:
     st.markdown("### Kullanılan denklemler")
@@ -1464,6 +1819,12 @@ with tab_eq:
     st.latex(r"\rho\,c_p(T)\,\frac{\partial T}{\partial t}+\frac{\dot C}{A}\frac{\partial T}{\partial z}=\frac{\partial}{\partial z}\!\left(k_{eff}\frac{\partial T}{\partial z}\right)-\frac{UA_{yan}}{A\,H}\,(T-T_\infty)")
     st.latex(r"\dot C_{sarj}=\frac{\eta_h P_h}{T_{max}-T_{min}},\quad \dot C_{desarj}=\frac{P_d}{T_{max}-T_{min}},\quad P_{verilen}(t)=\dot C\,\big(T_{cikis}-T_{min}\big)")
 
+    st.markdown("**Hibrit (kompozit) yatak — ağırlıklı ortalama**")
+    st.latex(r"\rho_{k}=\varphi_1\rho_1+\varphi_2\rho_2,\qquad w_1=\frac{\varphi_1\rho_1}{\rho_{k}},\qquad c_{p,k}(T)=w_1\,c_{p,1}(T)+w_2\,c_{p,2}(T)")
+    st.markdown("**CSP şarj gücü**")
+    st.latex(r"Q_{solar}=A_{opt}\cdot DNI\cdot\eta_{opt}\;\;\Rightarrow\;\; P_{h}\leftarrow Q_{solar},\;\;\eta_h=1")
+    st.markdown("**Modüler tesis — ısı kaybı**")
+    st.latex(r"\dot Q_{kayip}=\sum_{i=1}^{N}U_iA_i\,(T-T_\infty)=N\cdot UA\!\left(\tfrac{V}{N}\right)(T-T_\infty),\qquad \Delta\%=\left(\frac{N\,UA(V/N)}{UA(V)}-1\right)\times100")
     st.markdown("**Optimizasyon (sabit hacim, iki değişken: H/R ve t)**")
     st.latex(r"V^{*}=\frac{Q_{hedef}}{\rho\,[\,h(T_{max})-h(T_{min})\,]},\qquad \min_{H/R,\;t}\; f=UA\,(T_{max}-T_\infty)")
     st.latex(r"f_{maliyet}=c_{ins}\,V_{ins}+c_E\,E_{kayip,yil}\,N,\quad V_{ins}=\pi (R+t)^2 (H+2t)-\pi R^2 H,\quad E_{kayip,yil}=UA\,(\bar T-T_\infty)\,8760")
@@ -1536,6 +1897,20 @@ with tab_eq:
         ("Kesme eşiği", "Şarj/deşarjı bitiren çıkış sıcaklığı seviyesi (ΔT yüzdesi olarak)", "%"),
     ]))
 
+    st.markdown("**Hibrit yatak, CSP ve modüler tesis**")
+    st.markdown(md_table([
+        ("φ₁, φ₂", "Malzeme 1 ve 2'nin hacim kesirleri (φ₁ + φ₂ = 1)", "–"),
+        ("w₁, w₂", "Malzeme 1 ve 2'nin kütle kesirleri", "–"),
+        ("ρ_k", "Kompozit yığın yoğunluğu", "kg/m³"),
+        ("c_p,k", "Kompozit özgül ısı (kütle ağırlıklı ortalama)", "J/(kg·K)"),
+        ("A_opt", "Toplam optik toplama alanı (Fresnel/helyostat)", "m²"),
+        ("DNI", "Doğrudan normal ışınım", "W/m²"),
+        ("η_opt", "Toplam optik verim", "–"),
+        ("Q_solar", "CSP ile hesaplanan şarj (ısıl) gücü", "MW"),
+        ("N", "Silo modül sayısı (3D sekmesi; optimizasyonda ekonomik ömür de N_yıl ile gösterilir)", "adet"),
+        ("V/N", "Modül başına hacim", "m³"),
+        ("Δ%", "Tek dev siloya göre toplam ısı kaybı artışı", "%"),
+    ]))
     st.markdown("**Analiz ve optimizasyon**")
     st.markdown(md_table([
         ("V*", "Hedef enerjiyi sağlayan gerekli kum hacmi", "m³"),
@@ -1561,6 +1936,9 @@ with tab_eq:
 - **Round-trip verimi:** Elektrik → ısı → ısı (power-to-heat). Isı tekrar elektriğe çevrilecekse güç çevrimi verimiyle (örn. ≈ %20–40) çarpılmalıdır.
 - **0-D deşarj süresi kartı** kayıpsız idealdir; kayıplı süre çevrim özetinde ve 1-D sekmesinde bulunur.
 - **Optimizasyon:** Hacim, hedef enerjiden doğrudan çıkar; ızgara taraması + yakınlaştırma ile H/R ve t aranır. Maliyet amacı basit (iskontosuz) bir ön tasarım modelidir; birim fiyatlar kullanıcı girdisidir ve yıllık kayıp ortalama sıcaklıkta sürekli bekleme varsayar.
+- **Hibrit yatak:** İdeal karışım (hacimler toplanır; ince tanelerin boşluk doldurarak yığın yoğunluğunu artırması ihmal edilir). Karışım homojen kabul edilir; 3D sekmedeki katmanlı görünüm yalnızca görsel temsildir.
+- **CSP şarjı:** Q_solar sabit (sabit DNI, gündüz-gece/bulut kesintisi yok) ve tamamen kuma aktarılır (η_ısıtıcı uygulanmaz). Gerçek takvim süresi için günlük güneşlenme profili gerekir.
+- **Modüler tesis:** N özdeş modül, aynı H/R ve yalıtım; güç eşit paylaştırılır, modüller arası ısıl etkileşim ve boru/kolektör kayıpları ihmal edilir. 1-D çözümde tek modül çözülüp enerjiler N ile çarpılır.
 - **Parametre taraması** 0-D model üzerinde ince ızgarada, isteğe bağlı olarak 1-D modelde kaba ızgarada yapılır.
 - Ön tasarım aracıdır; ayrıntılı tasarım için CFD veya iki-fazlı (Schumann) yatak modelleri gerekir.
         """
@@ -1591,7 +1969,7 @@ with tab_data:
             st.markdown("**Çevrim özeti (0-D | 1-D)**")
             q1, q2, q3, q4 = st.columns(4)
             q1.metric("Şarj süresi", f"{cy['t_charge_h']:,.1f} sa", delta=f"1-D: {tc['t_charge_h']:,.1f} sa", delta_color="off")
-            q2.metric("Çekilen elektrik", f"{cy['e_in_mwh']:,.1f} MWh", delta=f"1-D: {tc['e_in_mwh']:,.1f} MWh", delta_color="off")
+            q2.metric("Şarj girdi enerjisi", f"{cy['e_in_mwh']:,.1f} MWh", delta=f"1-D: {tc['e_in_mwh']:,.1f} MWh", delta_color="off")
             q3.metric("Gerçek deşarj süresi", f"{cy['t_discharge_h']:,.1f} sa", delta=f"1-D: {tc['t_dis_h']:,.1f} sa", delta_color="off")
             q4.metric("Verilen ısı", f"{cy['e_out_mwh']:,.1f} MWh", delta=f"1-D: {tc['e_out_mwh']:,.1f} MWh", delta_color="off")
         st.markdown("**Soğuma simülasyonu verisi**")
